@@ -1,0 +1,5 @@
+streamlit==1.45.1
+supabase==2.15.3
+yfinance==0.2.63
+python-dotenv==1.1.0
+pandas==2.3.0
