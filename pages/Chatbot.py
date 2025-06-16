@@ -1,12 +1,25 @@
 import streamlit as st
 from openai import OpenAI
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 import imaplib
 import json
 from imap_tools import MailBox, AND
+from supabase import create_client
 import tempfile
+
+# Initialize Supabase client
+try:
+    with open('.streamlit/secrets.toml') as f:
+        config = json.load(f)
+        supabase_url = config.get('SUPABASE_URL')
+        supabase_key = config.get('SUPABASE_KEY')
+except:
+    supabase_url = st.secrets["SUPABASE_URL"]
+    supabase_key = st.secrets["SUPABASE_KEY"]
+supabase = create_client(supabase_url, supabase_key)
+
 # Initialize session state
 
 try:
@@ -131,6 +144,61 @@ def process_uploaded_file(uploaded_file):
     
 
 
+def handle_tool_calls(tool_calls, thread_id, run_id):
+    """Process tool calls from the assistant"""
+    # Transform tool_calls into a list of objects
+    tool_calls_list = []
+    for tool_call in tool_calls:
+        tool_call_object = {
+            tool_call.function.name: {
+                "arguments": json.loads(tool_call.function.arguments)
+            }
+        }
+        tool_calls_list.append(tool_call_object)
+    
+    tools_outputs = []
+    
+    # Process each tool call
+    for tool_call in tool_calls:
+        if tool_call.function.name == 'add_to_dashboard':
+            args = json.loads(tool_call.function.arguments)
+            result = add_to_dashboard(args['company_names'])
+            tools_outputs.append({
+                "tool_call_id": tool_call.id,
+                "output": json.dumps(result)
+            })
+    
+    return tools_outputs
+
+def add_to_dashboard(company_names):
+    """Add companies to dashboard"""
+    results = {}
+    for company in company_names:
+        try:
+            # Create timestamp in ISO format for JSON serialization
+            current_time = datetime.now(timezone.utc).isoformat()
+            
+            # Check if company exists in database
+            response = supabase.table('tickers').select('ticker').eq('ticker', company).execute()
+            
+            if response.data:
+                # Update existing company
+                supabase.table('tickers').update(
+                    {'last_accessed': current_time}
+                ).eq('ticker', company).execute()
+                results[company] = f"Updated last accessed time for {company}"
+            else:
+                # Add new company
+                supabase.table('tickers').insert(
+                    {'ticker': company, 'last_accessed': current_time}
+                ).execute()
+                results[company] = f"Added {company} to dashboard"
+                
+        except Exception as e:
+            results[company] = f"Error processing {company}: {str(e)}"
+    
+    return results
+
 def ask_question(question, thread_id):
     """Send question to assistant and get response"""
     try:
@@ -159,7 +227,21 @@ def ask_question(question, thread_id):
             assistant_id=assistant.id,
         )
 
-        # Get response
+        # Check if the assistant requires actions
+        if run.status == 'requires_action':
+            tool_calls = run.required_action.submit_tool_outputs.tool_calls
+            
+            # Process tool calls and get outputs
+            tool_outputs = handle_tool_calls(tool_calls, thread.id, run.id)
+            
+            # Submit tool outputs back to assistant
+            run = client.beta.threads.runs.submit_tool_outputs_and_poll(
+                thread_id=thread.id,
+                run_id=run.id,
+                tool_outputs=tool_outputs
+            )
+
+        # Get final response
         messages = client.beta.threads.messages.list(
             thread_id=thread.id
         )

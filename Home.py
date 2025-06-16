@@ -91,8 +91,8 @@ st.header("Recently Viewed")
 response = supabase.table('tickers').select("*").execute()
 records = response.data
 
-# Filter recent records (within last 3 minutes)
-recent_threshold = datetime.now(timezone.utc) - timedelta(minutes=3)
+# Filter recent records (within last 5 days)
+recent_threshold = datetime.now(timezone.utc) - timedelta(days=5)
 recent_records = []
 other_records = []
 
