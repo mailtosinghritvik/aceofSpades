@@ -1,13 +1,23 @@
 import streamlit as st
 from openai import OpenAI
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import time
 import imaplib
 import json
 from imap_tools import MailBox, AND
 from supabase import create_client
 import tempfile
+from ics import Calendar, Event
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+
+# Email configuration
+email_sender = st.secrets["EMAIL_SENDER"]  # Use Streamlit secrets for securi
+sender_password = st.secrets["EMAIL_PASSWORD2"]  # Use Streamlit secrets for security
+EMAIL_RECEIVER = "adam@ace148.com"
 
 # Initialize Supabase client
 try:
@@ -147,8 +157,10 @@ def process_uploaded_file(uploaded_file):
 def handle_tool_calls(tool_calls, thread_id, run_id):
     """Process tool calls from the assistant"""
     # Transform tool_calls into a list of objects
+    print("Processing tool calls...")
     tool_calls_list = []
     for tool_call in tool_calls:
+        print(f"Processing tool call: {tool_call.function.name} with arguments {tool_call.function.arguments}")
         tool_call_object = {
             tool_call.function.name: {
                 "arguments": json.loads(tool_call.function.arguments)
@@ -160,9 +172,16 @@ def handle_tool_calls(tool_calls, thread_id, run_id):
     
     # Process each tool call
     for tool_call in tool_calls:
+        args = json.loads(tool_call.function.arguments)
+        
         if tool_call.function.name == 'add_to_dashboard':
-            args = json.loads(tool_call.function.arguments)
             result = add_to_dashboard(args['company_names'])
+            tools_outputs.append({
+                "tool_call_id": tool_call.id,
+                "output": json.dumps(result)
+            })
+        elif tool_call.function.name == 'send_email_calendar_invite':
+            result = send_email_calendar_invite(args['date'], args['event'])
             tools_outputs.append({
                 "tool_call_id": tool_call.id,
                 "output": json.dumps(result)
@@ -229,6 +248,7 @@ def ask_question(question, thread_id):
 
         # Check if the assistant requires actions
         if run.status == 'requires_action':
+            print("Assistant requires action, processing tool calls...")
             tool_calls = run.required_action.submit_tool_outputs.tool_calls
             
             # Process tool calls and get outputs
@@ -314,6 +334,92 @@ def sync_from_email():
     except Exception as e:
         st.error(f"Error syncing from email: {str(e)}")
         return False
+
+def create_calendar_event(event_name, start_datetime, end_datetime=None, description=None):
+    """Create a calendar event and return the file path"""
+    C = Calendar()
+    e = Event()
+    e.name = event_name
+    e.begin = start_datetime
+    if end_datetime is None:
+        end_datetime = start_datetime + timedelta(days=1)
+    e.end = end_datetime
+    if description:
+        e.description = description
+    C.events.add(e)
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.ics') as f:
+            f.write(C.serialize().encode('utf-8'))
+            file_path = f.name
+        return file_path
+    except Exception as e:
+        st.error(f"Error creating calendar event: {str(e)}")
+        return None
+
+def send_email_with_attachment(subject, body, attachment_path):
+    """Send an email with an ICS attachment"""
+    try:
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(email_sender, sender_password)
+
+        msg = MIMEMultipart()
+        msg['Subject'] = subject
+        msg['From'] = email_sender
+        msg['To'] = EMAIL_RECEIVER
+
+        msg.attach(MIMEText(body))
+
+        with open(attachment_path, 'rb') as f:
+            attachment = MIMEApplication(f.read(), _subtype='ics')
+            attachment.add_header('Content-Disposition', 'attachment', 
+                                filename=os.path.basename(attachment_path))
+            msg.attach(attachment)
+
+        server.sendmail(email_sender, EMAIL_RECEIVER, msg.as_string())
+        server.quit()
+        return True
+    except Exception as e:
+        st.error(f"Error sending email: {str(e)}")
+        return False
+
+def send_email_calendar_invite(date, eventname):
+    """Main function to create and send calendar invite"""
+    try:
+        # Parse the date string to datetime
+        event_datetime = datetime.fromisoformat(date.replace('Z', '+00:00'))
+        
+        # Create the calendar event
+        ics_path = create_calendar_event(
+            event_name=eventname,
+            start_datetime=event_datetime,
+            description=f"Calendar invite for {eventname}"
+        )
+        
+        if not ics_path:
+            return {"status": "error", "message": "Failed to create calendar event"}
+        
+        # Send the email
+        email_sent = send_email_with_attachment(
+            subject=f"Calendar Invite: {eventname}",
+            body=f"Please find attached the calendar invite for {eventname} scheduled for {event_datetime.strftime('%Y-%m-%d %H:%M')}",
+            attachment_path=ics_path
+        )
+        
+        # Clean up the temporary file
+        try:
+            os.unlink(ics_path)
+        except:
+            pass
+        
+        if email_sent:
+            return {"status": "success", "message": f"Calendar invite sent for {eventname}"}
+        else:
+            return {"status": "error", "message": "Failed to send email"}
+            
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 # Page UI
 st.title("AceBot Chat")
