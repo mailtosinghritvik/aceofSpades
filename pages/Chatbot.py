@@ -17,7 +17,7 @@ from email.mime.application import MIMEApplication
 # Email configuration
 email_sender = st.secrets["EMAIL_SENDER"]  # Use Streamlit secrets for securi
 sender_password = st.secrets["EMAIL_PASSWORD2"]  # Use Streamlit secrets for security
-EMAIL_RECEIVER = "mailtosinghritvik@gmail.com"
+EMAIL_RECEIVER = "adam@ace148.com"
 
 # Initialize Supabase client
 try:
