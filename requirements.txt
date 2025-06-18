@@ -1,10 +1,10 @@
 beautifulsoup4==4.13.4
-fpdf2==2.7.6
-html2text==2024.2.26
+fpdf2==2.8.3
+html2text==2025.4.15
 ics==0.7.2
 imap_tools==1.10.0
 openai==1.88.0
-pillow==10.2.0
+Pillow==11.2.1
 Requests==2.32.4
 streamlit==1.45.1
 supabase==2.15.3
