@@ -384,12 +384,39 @@ def send_email_with_attachment(subject, body, attachment_path):
         st.error(f"Error sending email: {str(e)}")
         return False
 
-def send_email_calendar_invite(date, eventname):
-    """Main function to create and send calendar invite"""
+def send_email_calendar_invite(date: str, eventname: str):
+    """
+    Create and send a calendar invite email.
+    
+    Args:
+        date (str): ISO 8601 format date or 'unknown+X' where X is hours from now
+        eventname (str): Name of the event
+    
+    Returns:
+        dict: Status and message of the operation
+    """
     try:
-        # Parse the date string to datetime
-        event_datetime = datetime.fromisoformat(date.replace('Z', '+00:00'))
-        
+        # Handle unknown+ cases
+        if date.startswith('unknown+'):
+            try:
+                # Extract hours to add from unknown+X format
+                hours_to_add = int(date.split('+')[1])
+                event_datetime = datetime.now(timezone.utc) + timedelta(hours=hours_to_add)
+            except (IndexError, ValueError):
+                return {
+                    "status": "error",
+                    "message": "Invalid unknown+ format. Expected unknown+X where X is hours to add"
+                }
+        else:
+            # Handle ISO 8601 format
+            try:
+                event_datetime = datetime.fromisoformat(date.replace('Z', '+00:00'))
+            except ValueError:
+                return {
+                    "status": "error",
+                    "message": "Invalid date format. Expected ISO 8601 format or unknown+X format"
+                }
+
         # Create the calendar event
         ics_path = create_calendar_event(
             event_name=eventname,
@@ -400,26 +427,29 @@ def send_email_calendar_invite(date, eventname):
         if not ics_path:
             return {"status": "error", "message": "Failed to create calendar event"}
         
-        # Send the email
+        # Send the email with the calendar invite
         email_sent = send_email_with_attachment(
             subject=f"Calendar Invite: {eventname}",
-            body=f"Please find attached the calendar invite for {eventname} scheduled for {event_datetime.strftime('%Y-%m-%d %H:%M')}",
+            body=f"Please find attached the calendar invite for {eventname} scheduled for {event_datetime.strftime('%Y-%m-%d %H:%M %Z')}",
             attachment_path=ics_path
         )
         
-        # Clean up the temporary file
+        # Clean up temporary file
         try:
             os.unlink(ics_path)
         except:
             pass
-        
+            
         if email_sent:
-            return {"status": "success", "message": f"Calendar invite sent for {eventname}"}
+            return {
+                "status": "success",
+                "message": f"Calendar invite sent for {eventname} scheduled for {event_datetime.strftime('%Y-%m-%d %H:%M %Z')}"
+            }
         else:
             return {"status": "error", "message": "Failed to send email"}
             
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Calendar invite error: {str(e)}"}
 
 # Page UI
 st.title("AceBot Chat")
