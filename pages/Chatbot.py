@@ -13,18 +13,11 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
-import re
-from bs4 import BeautifulSoup
-from fpdf import FPDF
-import html2text
-import base64
-import io
-from PIL import Image
 
 # Email configuration
 email_sender = st.secrets["EMAIL_SENDER"]  # Use Streamlit secrets for securi
 sender_password = st.secrets["EMAIL_PASSWORD2"]  # Use Streamlit secrets for security
-EMAIL_RECEIVER = "mailtosinghritvik@gmail.com"
+EMAIL_RECEIVER = "adam@ace148.com"
 
 # Initialize Supabase client
 try:
@@ -279,99 +272,6 @@ def ask_question(question, thread_id):
         st.error(f"Error processing question: {str(e)}")
         return None
 
-def create_email_pdf(msg):
-    """Convert an email to a PDF with all content and metadata repeated every 1500 characters"""
-    try:
-        # Initialize PDF
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", size=12)
-        
-        # Create metadata header
-        metadata = f"""
-From: {msg.from_}
-To: {', '.join(msg.to) if isinstance(msg.to, list) else msg.to}
-Subject: {msg.subject}
-Date: {msg.date.strftime('%Y-%m-%d %H:%M:%S')}
-"""
-        
-        # Add initial metadata
-        pdf.multi_cell(0, 10, metadata)
-        pdf.ln(10)
-        
-        # Process email content
-        if msg.html:
-            # Convert HTML to text
-            h = html2text.HTML2Text()
-            h.ignore_links = False
-            text_content = h.handle(msg.html)
-            
-            # Extract base64 images from HTML if present
-            soup = BeautifulSoup(msg.html, 'html.parser')
-            images = []
-            for img in soup.find_all('img'):
-                if img.get('src') and img['src'].startswith('data:image'):
-                    # Extract base64 data
-                    try:
-                        img_data = img['src'].split(',')[1]
-                        img_bytes = base64.b64decode(img_data)
-                        images.append(img_bytes)
-                    except:
-                        pass
-        else:
-            text_content = msg.text or "No content"
-        
-        # Split content into chunks
-        chunks = []
-        current_chunk = ""
-        for line in text_content.split('\n'):
-            if len(current_chunk) + len(line) + 1 > 1500:
-                chunks.append(current_chunk)
-                current_chunk = line + '\n'
-            else:
-                current_chunk += line + '\n'
-                
-        if current_chunk:
-            chunks.append(current_chunk)
-        
-        # Add content to PDF with metadata after each chunk
-        for chunk in chunks:
-            pdf.multi_cell(0, 10, chunk)
-            pdf.ln(5)
-            pdf.multi_cell(0, 10, metadata)
-            pdf.ln(10)
-        
-        # Add images if any were found
-        for img_data in images:
-            try:
-                image = Image.open(io.BytesIO(img_data))
-                # Save image to temp file
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as img_temp:
-                    image.save(img_temp.name)
-                    
-                # Add image to PDF - resizing to fit page width
-                page_width = pdf.w - 2 * pdf.l_margin
-                img_width = min(image.width, page_width)
-                img_height = int(image.height * (img_width / image.width))
-                
-                if pdf.get_y() + img_height > pdf.h - pdf.b_margin:
-                    pdf.add_page()
-                
-                pdf.image(img_temp.name, x=pdf.l_margin, w=img_width)
-                os.remove(img_temp.name)
-            except:
-                continue
-        
-        # Save PDF to temp file
-        pdf_path = tempfile.mktemp(suffix=".pdf")
-        pdf.output(pdf_path)
-        
-        return pdf_path
-    
-    except Exception as e:
-        st.error(f"Error creating PDF: {str(e)}")
-        return None
-
 def sync_from_email():
     """Fetch emails and attachments and add them to the vector store"""
     try:
@@ -381,44 +281,52 @@ def sync_from_email():
 
         successful_uploads = 0
         with MailBox("imap.gmail.com").login(email, password, 'INBOX') as mailbox:
+            #unseen only
             for msg in mailbox.fetch(AND(seen=False)):
                 try:
-                    # Create a PDF from the email content
-                    pdf_path = create_email_pdf(msg)
-                    if pdf_path:
-                        # Upload the PDF to the vector store
-                        with open(pdf_path, "rb") as f:
+                    # Create a temporary markdown file for the email content
+                    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.md') as temp_email:
+                        md_content = f"""# Email from {msg.from_}
+**Subject**: {msg.subject}  
+**Received**: {msg.date.strftime('%Y-%m-%d %H:%M:%S')}  
+
+{msg.text or msg.html or ""}
+"""
+                        temp_email.write(md_content)
+                        temp_email.flush()
+
+                    # Upload email content to vector store
+                    with open(temp_email.name, "rb") as f:
+                        file_batch = client.vector_stores.file_batches.upload_and_poll(
+                            vector_store_id='vs_qUspcB7VllWXM4z7aAEdIK9L',
+                            files=[f]
+                        )
+                        if file_batch.status == "completed":
+                            successful_uploads += 1
+
+                    # Clean up email temp file
+                    os.unlink(temp_email.name)
+
+                    # Process attachments
+                    for att in msg.attachments:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(att.filename)[1]) as temp_att:
+                            temp_att.write(att.payload)
+                            temp_att.flush()
+
+                        # Upload attachment to vector store
+                        with open(temp_att.name, "rb") as f:
                             file_batch = client.vector_stores.file_batches.upload_and_poll(
                                 vector_store_id='vs_qUspcB7VllWXM4z7aAEdIK9L',
                                 files=[f]
                             )
-                        
-                        # Clean up temporary PDF file
-                        os.remove(pdf_path)
-                        
-                        if file_batch.status == "completed":
-                            successful_uploads += 1
-                    
-                    # Process attachments separately
-                    for att in msg.attachments:
-                        if os.path.splitext(att.filename)[1].lower() in ['.pdf', '.txt', '.csv', '.docx']:
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(att.filename)[1]) as temp_att:
-                                temp_att.write(att.payload)
-                                temp_att_path = temp_att.name
-                            
-                            with open(temp_att_path, "rb") as f:
-                                file_batch = client.vector_stores.file_batches.upload_and_poll(
-                                    vector_store_id='vs_qUspcB7VllWXM4z7aAEdIK9L',
-                                    files=[f]
-                                )
-                            
-                            os.remove(temp_att_path)
-                            
                             if file_batch.status == "completed":
                                 successful_uploads += 1
-                    
-                except Exception as inner_e:
-                    st.error(f"Error processing email: {str(inner_e)}")
+
+                        # Clean up attachment temp file
+                        os.unlink(temp_att.name)
+
+                except Exception as e:
+                    st.warning(f"Error processing an email or its attachments: {str(e)}")
                     continue
 
         return successful_uploads
