@@ -13,11 +13,19 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
+import re
+from bs4 import BeautifulSoup
+from fpdf import FPDF
+import html2text
+import base64
+import io
+from PIL import Image
+import unicodedata
 
 # Email configuration
 email_sender = st.secrets["EMAIL_SENDER"]  # Use Streamlit secrets for securi
 sender_password = st.secrets["EMAIL_PASSWORD2"]  # Use Streamlit secrets for security
-EMAIL_RECEIVER = "adam@ace148.com"
+EMAIL_RECEIVER = "mailtosinghritvik@gmail.com"
 
 # Initialize Supabase client
 try:
@@ -272,6 +280,127 @@ def ask_question(question, thread_id):
         st.error(f"Error processing question: {str(e)}")
         return None
 
+def create_email_pdf(msg):
+    """Convert an email to a PDF with all content and metadata repeated every 1500 characters"""
+    try:
+        import html2text
+        from fpdf import FPDF
+        import tempfile
+        import re
+        from PIL import Image
+        import io
+        import base64
+        import unicodedata
+
+        # Initialize PDF with standard font and larger margins
+        pdf = FPDF()
+        pdf.set_left_margin(15)
+        pdf.set_right_margin(15)
+        pdf.set_top_margin(15)
+        pdf.add_page()
+        pdf.set_font("Arial", size=9)  # Even smaller font
+        
+        # Create metadata header
+        from_str = sanitize_text(str(msg.from_))
+        to_str = sanitize_text(str(', '.join(msg.to) if isinstance(msg.to, list) else str(msg.to)))
+        subject_str = sanitize_text(str(msg.subject))
+        
+        # Keep metadata short and simple
+        metadata = f"""From: {from_str[:50]}...
+To: {to_str[:50]}...
+Subject: {subject_str[:50]}...
+Date: {msg.date.strftime('%Y-%m-%d %H:%M:%S')}
+{'='*50}"""
+        
+        # Process email content
+        if msg.html:
+            h2t = html2text.HTML2Text()
+            h2t.ignore_links = True  # Ignore links to avoid long URLs
+            h2t.body_width = 60  # Narrower width
+            raw_text = h2t.handle(msg.html)
+        else:
+            raw_text = msg.text or "No content"
+        
+        # Sanitize content
+        text_content = sanitize_text(raw_text)
+        
+        # Simple function to add text with basic wrapping
+        def add_text_simple(pdf, text):
+            """Add text with simple character-based wrapping"""
+            # Split into lines
+            lines = text.split('\n')
+            
+            for line in lines:
+                # If line is empty, just add space
+                if not line.strip():
+                    pdf.ln(3)
+                    continue
+                
+                # Break long lines into chunks of 60 characters
+                while len(line) > 60:
+                    chunk = line[:60]
+                    # Try to break at a space if possible
+                    if ' ' in chunk:
+                        last_space = chunk.rfind(' ')
+                        if last_space > 40:  # Only break at space if it's not too early
+                            chunk = chunk[:last_space]
+                            line = line[last_space+1:]
+                        else:
+                            line = line[60:]
+                    else:
+                        line = line[60:]
+                    
+                    try:
+                        pdf.cell(0, 4, chunk, ln=True)
+                    except:
+                        # If even this fails, skip this chunk
+                        pdf.cell(0, 4, "[Content skipped]", ln=True)
+                
+                # Add remaining text
+                if line:
+                    try:
+                        pdf.cell(0, 4, line, ln=True)
+                    except:
+                        pdf.cell(0, 4, "[Content skipped]", ln=True)
+        
+        # Add initial metadata
+        add_text_simple(pdf, metadata)
+        pdf.ln(5)
+        
+        # Split content into chunks
+        max_chunk_size = 1200  # Smaller chunks
+        chunks = []
+        for i in range(0, len(text_content), max_chunk_size):
+            chunks.append(text_content[i:i+max_chunk_size])
+        
+        # Add content chunks
+        for i, chunk in enumerate(chunks[:10]):  # Limit to 10 chunks to avoid huge PDFs
+            try:
+                add_text_simple(pdf, f"\n--- Part {i+1} ---\n")
+                add_text_simple(pdf, chunk)
+                pdf.ln(5)
+                add_text_simple(pdf, metadata)
+                pdf.ln(8)
+                
+                # Add new page if getting close to bottom
+                if pdf.get_y() > 250:
+                    pdf.add_page()
+                    
+            except Exception as chunk_error:
+                # Skip problematic chunks
+                add_text_simple(pdf, f"[Part {i+1} could not be processed]")
+                continue
+        
+        # Save PDF
+        pdf_path = tempfile.mktemp(suffix=".pdf")
+        pdf.output(pdf_path)
+        
+        return pdf_path
+        
+    except Exception as e:
+        st.error(f"Error creating PDF: {str(e)}")
+        return None
+
 def sync_from_email():
     """Fetch emails and attachments and add them to the vector store"""
     try:
@@ -281,52 +410,44 @@ def sync_from_email():
 
         successful_uploads = 0
         with MailBox("imap.gmail.com").login(email, password, 'INBOX') as mailbox:
-            #unseen only
             for msg in mailbox.fetch(AND(seen=False)):
                 try:
-                    # Create a temporary markdown file for the email content
-                    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.md') as temp_email:
-                        md_content = f"""# Email from {msg.from_}
-**Subject**: {msg.subject}  
-**Received**: {msg.date.strftime('%Y-%m-%d %H:%M:%S')}  
-
-{msg.text or msg.html or ""}
-"""
-                        temp_email.write(md_content)
-                        temp_email.flush()
-
-                    # Upload email content to vector store
-                    with open(temp_email.name, "rb") as f:
-                        file_batch = client.vector_stores.file_batches.upload_and_poll(
-                            vector_store_id='vs_qUspcB7VllWXM4z7aAEdIK9L',
-                            files=[f]
-                        )
-                        if file_batch.status == "completed":
-                            successful_uploads += 1
-
-                    # Clean up email temp file
-                    os.unlink(temp_email.name)
-
-                    # Process attachments
-                    for att in msg.attachments:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(att.filename)[1]) as temp_att:
-                            temp_att.write(att.payload)
-                            temp_att.flush()
-
-                        # Upload attachment to vector store
-                        with open(temp_att.name, "rb") as f:
+                    # Create a PDF from the email content
+                    pdf_path = create_email_pdf(msg)
+                    if pdf_path:
+                        # Upload the PDF to the vector store
+                        with open(pdf_path, "rb") as f:
                             file_batch = client.vector_stores.file_batches.upload_and_poll(
                                 vector_store_id='vs_qUspcB7VllWXM4z7aAEdIK9L',
                                 files=[f]
                             )
+                        
+                        # Clean up temporary PDF file
+                        os.remove(pdf_path)
+                        
+                        if file_batch.status == "completed":
+                            successful_uploads += 1
+                    
+                    # Process attachments separately
+                    for att in msg.attachments:
+                        if os.path.splitext(att.filename)[1].lower() in ['.pdf', '.txt', '.csv', '.docx']:
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(att.filename)[1]) as temp_att:
+                                temp_att.write(att.payload)
+                                temp_att_path = temp_att.name
+                            
+                            with open(temp_att_path, "rb") as f:
+                                file_batch = client.vector_stores.file_batches.upload_and_poll(
+                                    vector_store_id='vs_qUspcB7VllWXM4z7aAEdIK9L',
+                                    files=[f]
+                                )
+                            
+                            os.remove(temp_att_path)
+                            
                             if file_batch.status == "completed":
                                 successful_uploads += 1
-
-                        # Clean up attachment temp file
-                        os.unlink(temp_att.name)
-
-                except Exception as e:
-                    st.warning(f"Error processing an email or its attachments: {str(e)}")
+                    
+                except Exception as inner_e:
+                    st.error(f"Error processing email: {str(inner_e)}")
                     continue
 
         return successful_uploads
@@ -450,6 +571,37 @@ def send_email_calendar_invite(date: str, eventname: str):
             
     except Exception as e:
         return {"status": "error", "message": f"Calendar invite error: {str(e)}"}
+
+def sanitize_text(text):
+    """Sanitize text to make it compatible with standard PDF fonts"""
+    if not text:
+        return ""
+    
+    # Replace common problematic characters
+    replacements = {
+        '\u2018': "'", '\u2019': "'", '\u201c': '"', '\u201d': '"',  # Smart quotes
+        '\u2013': '-', '\u2014': '--',  # En/em dashes
+        '\u2026': '...', # Ellipsis
+        '\u00a0': ' ',  # Non-breaking space
+        '\u2028': ' ', '\u2029': ' ',  # Line/paragraph separators
+    }
+    
+    for char, replacement in replacements.items():
+        text = text.replace(char, replacement)
+    
+    # Ensure we only have printable ASCII
+    result = ""
+    for char in text:
+        if ord(char) < 128 and (char.isprintable() or char in '\n\r\t'):
+            result += char
+        else:
+            # Replace unsupported characters with simple substitutes
+            if char in '""''„‟«»‹›': result += '"'
+            elif char in '—–': result += '-'
+            elif char in '•∙⋅': result += '*'
+            else: result += ' '  # Replace any other unsupported char with space
+    
+    return result
 
 # Page UI
 st.title("AceBot Chat")
