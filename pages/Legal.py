@@ -27,6 +27,10 @@ email_sender = st.secrets["EMAIL_SENDER"]  # Use Streamlit secrets for securi
 sender_password = st.secrets["EMAIL_PASSWORD2"]  # Use Streamlit secrets for security
 EMAIL_RECEIVER = "mailtosinghritvik@gmail.com"
 
+# Assistant IDs
+MAIN_ASSISTANT_ID = "asst_XyZMGdTIIvPQGUzHzdBuvZvn"
+KNOWLEDGE_EXTRACTION_ASSISTANT_ID = "asst_eroB2BdDIRXlR7SikvVV7OgP"
+
 # Initialize Supabase client
 try:
     with open('.streamlit/secrets.toml') as f:
@@ -59,6 +63,10 @@ if 'current_thread_name' not in st.session_state:
 if 'messages' not in st.session_state:
     st.session_state.messages = []
 
+# Load threads from database if not already loaded
+if 'db_threads_loaded' not in st.session_state:
+    st.session_state.db_threads_loaded = False
+
 # Create upload directory
 UPLOAD_FOLDER = os.path.join(os.getcwd(), "temp")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -77,6 +85,67 @@ def get_client():
             return None
     return st.session_state.openai_client
 
+def load_threads_from_db():
+    """Load threads from Supabase database"""
+    try:
+        print("Loading threads from database...")
+        response = supabase.table("Threads").select("thread_id").execute()
+        print(f"Found {len(response.data)} threads in database")
+        
+        client = get_client()
+        if not client:
+            print("No OpenAI client available")
+            return
+            
+        # For each thread in DB, retrieve it and add to session state
+        for record in response.data:
+            thread_id = record['thread_id']
+            print(f"Processing thread: {thread_id}")
+            
+            # Skip if already in session state
+            if thread_id in st.session_state.threads:
+                print(f"Thread {thread_id} already in session state")
+                continue
+                
+            try:
+                # Retrieve thread from OpenAI
+                thread = client.beta.threads.retrieve(thread_id)
+                print(f"Retrieved thread {thread_id} from OpenAI")
+                
+                # Get first message to use as thread name (or use default)
+                try:
+                    messages = client.beta.threads.messages.list(thread_id=thread_id, limit=1, order="asc")
+                    if messages.data:
+                        # Use first few words of first message as thread name
+                        first_message = messages.data[0].content[0].text.value[:50]
+                        thread_name = f"{first_message}..." if len(first_message) == 50 else first_message
+                    else:
+                        thread_name = f"Thread {thread_id[:8]}"
+                except:
+                    thread_name = f"Thread {thread_id[:8]}"
+                
+                print(f"Thread name: {thread_name}")
+                
+                # Add to session state
+                st.session_state.threads[thread_id] = {
+                    'thread': thread,
+                    'name': thread_name
+                }
+                print(f"Added thread {thread_id} to session state")
+                
+            except Exception as inner_e:
+                print(f"Could not retrieve thread {thread_id}: {str(inner_e)}")
+                # Clean up orphaned DB entry
+                try:
+                    supabase.table("Threads").delete().eq("thread_id", thread_id).execute()
+                    print(f"Cleaned up orphaned thread {thread_id}")
+                except:
+                    pass
+    
+    except Exception as e:
+        print(f"Error loading threads from database: {str(e)}")
+        st.error(f"Error loading threads from database: {str(e)}")
+
 def create_thread(name=""):
     """Create a new thread with OpenAI"""
     try:
@@ -91,11 +160,20 @@ def create_thread(name=""):
         # Create thread using OpenAI API
         thread = client.beta.threads.create()
         
-        # Store thread info
+        # Store thread info in session state
         st.session_state.threads[thread.id] = {
             'thread': thread,
             'name': name
         }
+        
+        # Save to Supabase database
+        try:
+            supabase.table("Threads").insert({
+                "thread_id": thread.id
+            }).execute()
+        except Exception as db_e:
+            # If DB save fails, still return the thread but show warning
+            st.warning(f"Thread created but not saved to database: {str(db_e)}")
         
         return thread.id, name
     except Exception as e:
@@ -103,15 +181,23 @@ def create_thread(name=""):
         return None, None
 
 def delete_thread(thread_id):
-    """Delete a thread"""
+    """Delete a thread from session state and database"""
     try:
+        # Delete from session state
         if thread_id in st.session_state.threads:
             del st.session_state.threads[thread_id]
             if st.session_state.current_thread_id == thread_id:
                 st.session_state.current_thread_id = None
                 st.session_state.current_thread_name = None
-            return True
-        return False
+                st.session_state.messages = []  # Clear messages when deleting current thread
+        
+        # Delete from Supabase database
+        try:
+            supabase.table("Threads").delete().eq("thread_id", thread_id).execute()
+        except Exception as db_e:
+            st.warning(f"Thread deleted locally but database deletion failed: {str(db_e)}")
+        
+        return True
     except Exception as e:
         st.error(f"Error deleting thread: {str(e)}")
         return False
@@ -122,6 +208,38 @@ def get_threads():
         {'id': thread_id, 'name': info['name']} 
         for thread_id, info in st.session_state.threads.items()
     ]
+
+def load_thread_messages(thread_id):
+    """Load messages from a thread into session state"""
+    try:
+        if not thread_id or thread_id not in st.session_state.threads:
+            st.session_state.messages = []
+            return
+            
+        client = get_client()
+        if not client:
+            st.session_state.messages = []
+            return
+            
+        # Get all messages from the thread
+        messages = client.beta.threads.messages.list(
+            thread_id=thread_id,
+            order="asc"  # Get messages in chronological order
+        )
+        
+        # Convert to session state format
+        st.session_state.messages = []
+        for message in reversed(messages.data):  # Reverse to get chronological order
+            role = message.role
+            content = message.content[0].text.value if message.content else ""
+            st.session_state.messages.append({
+                "role": role,
+                "content": content
+            })
+        
+    except Exception as e:
+        st.error(f"Error loading thread messages: {str(e)}")
+        st.session_state.messages = []
 
 def process_uploaded_file(uploaded_file):
     """Handle file upload and vector store integration"""
@@ -275,6 +393,140 @@ def ask_question(question, thread_id):
     except Exception as e:
         st.error(f"Error processing question: {str(e)}")
         return None
+
+def extract_thread_history(thread_id):
+    """Extract all messages from the current thread for knowledge extraction"""
+    try:
+        if not thread_id or thread_id not in st.session_state.threads:
+            return None
+            
+        client = get_client()
+        if not client:
+            return None
+            
+        thread = st.session_state.threads[thread_id]['thread']
+        
+        # Get all messages from the thread
+        messages = client.beta.threads.messages.list(
+            thread_id=thread.id,
+            order="asc"  # Get messages in chronological order
+        )
+        
+        # Format messages for analysis
+        chat_history = ""
+        for message in messages.data:
+            role = message.role
+            content = message.content[0].text.value if message.content else ""
+            chat_history += f"{role.upper()}: {content}\n\n"
+        
+        return chat_history
+        
+    except Exception as e:
+        st.error(f"Error extracting thread history: {str(e)}")
+        return None
+
+def extract_legal_knowledge(chat_history, thread_name):
+    """Extract legal knowledge, corrections, and updates from chat history"""
+    try:
+        client = get_client()
+        if not client:
+            return None
+            
+        # Create extraction prompt for legal context
+        extraction_prompt = f"""
+Please analyze this legal conversation and extract all NEW INFORMATION, CORRECTIONS, and CLARIFICATIONS provided by the user.
+
+Extract these types of legal knowledge:
+
+**Legal Definitions**: Terms explained or defined by the user
+**Date Corrections**: Any date changes, amendments, or clarifications provided by the user
+**Party Information**: Names, roles, or details about legal parties provided by the user
+**Document Details**: Classifications, corrections, or new document info provided by the user
+**Legal Updates**: Law changes, statute amendments, precedent updates mentioned by the user
+**Case Information**: New details about ongoing legal matters provided by the user
+**Corrections**: Any corrections to previous information provided by the user
+
+Format each as:
+**[Category] - [Item]**: [Explanation/Correction as provided by user]
+
+Only include information that was PROVIDED BY THE USER, not general legal knowledge from the assistant.
+
+Conversation to analyze:
+{chat_history}
+
+Thread: {thread_name}
+"""
+
+        # Use knowledge extraction assistant
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a legal knowledge extraction specialist. Extract only NEW information, corrections, and clarifications provided by users in legal conversations."},
+                {"role": "user", "content": extraction_prompt}
+            ],
+            max_tokens=2000,
+            temperature=0.1
+        )
+        
+        extracted_knowledge = response.choices[0].message.content
+        
+        # Filter out empty responses
+        if not extracted_knowledge or len(extracted_knowledge.strip()) < 50:
+            return None
+            
+        return extracted_knowledge
+        
+    except Exception as e:
+        st.error(f"Error extracting legal knowledge: {str(e)}")
+        return None
+
+def upload_legal_knowledge_to_vector_store(knowledge, thread_name):
+    """Upload extracted legal knowledge to the vector store"""
+    try:
+        client = get_client()
+        if not client:
+            return False
+            
+        # Create formatted markdown document
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        markdown_content = f"""# Legal Knowledge Update
+
+**Source Thread:** {thread_name}
+**Extracted Date:** {current_time}
+**Type:** Legal Knowledge Extraction
+
+---
+
+## Legal Information Updates
+
+{knowledge}
+
+---
+
+*This document contains legal information, corrections, and updates extracted from user conversations to build persistent knowledge for the Legal Assistant.*
+"""
+
+        # Create temporary file
+        temp_path = tempfile.mktemp(suffix=".md")
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(markdown_content)
+        
+        # Upload to same vector store as legal documents
+        with open(temp_path, "rb") as f:
+            file_batch = client.vector_stores.file_batches.upload_and_poll(
+                vector_store_id='vs_6891e6eddc188191b3535499ce08396f',
+                files=[f]
+            )
+        
+        # Clean up
+        os.remove(temp_path)
+        
+        return file_batch.status == "completed"
+        
+    except Exception as e:
+        st.error(f"Error uploading legal knowledge: {str(e)}")
+        return False
 
 def create_email_pdf(msg):
     """Convert an email to a PDF with all content and metadata repeated every 1500 characters"""
@@ -603,6 +855,13 @@ def sanitize_text(text):
 st.title("Legal Assistant")
 st.caption("Chat with your legal documents using AI")
 
+# Load threads from database if not already loaded
+if not st.session_state.db_threads_loaded:
+    st.write(f"Loading threads from database... Current threads in session: {len(st.session_state.threads)}")
+    load_threads_from_db()
+    st.session_state.db_threads_loaded = True
+    st.write(f"After loading: {len(st.session_state.threads)} threads in session")
+
 # Sidebar
 with st.sidebar:
     st.header("Legal Document Settings")
@@ -631,14 +890,21 @@ with st.sidebar:
         )
         
         if selected_thread:
-            st.session_state.current_thread_id = thread_options[selected_thread]
-            st.session_state.current_thread_name = selected_thread
+            new_thread_id = thread_options[selected_thread]
+            # Only load messages if we're switching to a different thread
+            if st.session_state.current_thread_id != new_thread_id:
+                st.session_state.current_thread_id = new_thread_id
+                st.session_state.current_thread_name = selected_thread
+                # Load messages from this thread
+                load_thread_messages(new_thread_id)
 
         if st.button("Delete Current Thread"):
             if st.session_state.current_thread_id:
                 if delete_thread(st.session_state.current_thread_id):
                     st.success("Thread deleted")
                     st.rerun()
+                else:
+                    st.error("Failed to delete thread")
 
     # File Upload
     st.subheader("Legal Document Upload")
@@ -658,6 +924,37 @@ with st.sidebar:
                 st.success(f"Successfully processed {uploads} items from email!")
             else:
                 st.error("Nothing to process or an error occurred.")
+
+    # Knowledge Extraction
+    st.subheader("Knowledge Extraction")
+    st.caption("Extract legal insights from current conversation")
+    
+    if st.button("Extract Legal Knowledge", help="Extract and save new legal information, corrections, and updates from this conversation"):
+        if st.session_state.current_thread_id and st.session_state.current_thread_name:
+            with st.spinner("Extracting legal knowledge..."):
+                # Extract conversation history
+                chat_history = extract_thread_history(st.session_state.current_thread_id)
+                
+                if chat_history:
+                    # Extract knowledge
+                    knowledge = extract_legal_knowledge(chat_history, st.session_state.current_thread_name)
+                    
+                    if knowledge:
+                        # Show preview
+                        st.write("**Knowledge Preview:**")
+                        st.text_area("Extracted Knowledge", knowledge, height=200, disabled=True)
+                        
+                        # Upload to vector store
+                        if upload_legal_knowledge_to_vector_store(knowledge, st.session_state.current_thread_name):
+                            st.success("✅ Legal knowledge extracted and saved!")
+                        else:
+                            st.error("Failed to save extracted knowledge")
+                    else:
+                        st.info("No significant new legal information found in this conversation.")
+                else:
+                    st.error("Could not extract conversation history")
+        else:
+            st.warning("Please select a thread to extract knowledge from")
 
 # Main chat interface
 if st.session_state.current_thread_id:
