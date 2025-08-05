@@ -22,16 +22,22 @@ st.set_page_config(
 
 # Load Supabase credentials
 try:
-    with open('.streamlit/secrets.toml') as f:
-        config = json.load(f)
-        supabase_url = config.get('SUPABASE_URL')
-        supabase_key = config.get('SUPABASE_KEY')
-except:
     supabase_url = st.secrets["SUPABASE_URL"]
     supabase_key = st.secrets["SUPABASE_KEY"]
+except Exception as e:
+    st.error(f"Error loading Supabase credentials: {e}")
+    st.stop()
 
 # Initialize Supabase client
-supabase = create_client(supabase_url, supabase_key)
+try:
+    supabase = create_client(supabase_url, supabase_key)
+    # Test connection with a simple query
+    test_response = supabase.table('tickers').select("count", count="exact").execute()
+    st.success(f"✅ Connected to Supabase successfully! Found {test_response.count} records.")
+except Exception as e:
+    st.error(f"❌ Failed to connect to Supabase: {e}")
+    st.error(f"URL: {supabase_url}")
+    st.stop()
 
 @st.cache_data(ttl=60)  # Cache data for 1 minute
 def get_stock_data(symbol):
