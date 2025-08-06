@@ -908,12 +908,92 @@ with st.sidebar:
 
     # File Upload
     st.subheader("Legal Document Upload")
-    uploaded_file = st.file_uploader("Upload Legal Document", type=['pdf'])
-    if uploaded_file:
-        if process_uploaded_file(uploaded_file):
-            st.success("Legal document uploaded successfully!")
+    uploaded_files = st.file_uploader(
+        "Upload Legal Documents",
+        type=['pdf', 'docx', 'txt', 'csv', 'zip'],
+        accept_multiple_files=True,
+        help="Upload single/multiple files or a ZIP archive containing supported documents"
+    )
+
+    def is_supported_file(filename):
+        supported_extensions = ['.pdf', '.docx', '.txt', '.csv']
+        ext = os.path.splitext(filename)[1].lower()
+        return ext in supported_extensions
+
+    def process_multiple_files(files):
+        success_count = 0
+        total_count = len(files)
+        for i, file in enumerate(files):
+            if is_supported_file(file.name):
+                if process_uploaded_file(file):
+                    success_count += 1
+        return {
+            "total": total_count,
+            "successful": success_count,
+            "failed": total_count - success_count
+        }
+
+    def process_zip_file(zip_file):
+        import zipfile
+        import shutil
+        from pathlib import Path
+        extract_dir = tempfile.mkdtemp()
+        success_count = 0
+        total_files = 0
+        try:
+            zip_path = os.path.join(UPLOAD_FOLDER, zip_file.name)
+            with open(zip_path, "wb") as f:
+                f.write(zip_file.getbuffer())
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+            for root, _, files in os.walk(extract_dir):
+                for filename in files:
+                    file_path = os.path.join(root, filename)
+                    file_ext = Path(filename).suffix.lower()
+                    if file_ext in ['.pdf', '.docx', '.txt', '.csv']:
+                        total_files += 1
+                        with open(file_path, 'rb') as file_content:
+                            class FileObject:
+                                def __init__(self, path, name):
+                                    self.path = path
+                                    self.name = name
+                                    with open(path, 'rb') as f:
+                                        self.content = f.read()
+                                def getbuffer(self):
+                                    return self.content
+                            file_obj = FileObject(file_path, filename)
+                            if process_uploaded_file(file_obj):
+                                success_count += 1
+            return {
+                "total": total_files,
+                "successful": success_count,
+                "failed": total_files - success_count
+            }
+        except Exception as e:
+            st.error(f"Error processing ZIP file: {str(e)}")
+            return {"total": 0, "successful": 0, "failed": 0}
+        finally:
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+            shutil.rmtree(extract_dir, ignore_errors=True)
+
+    if uploaded_files:
+        # If only one file and it's a ZIP, process as ZIP
+        if len(uploaded_files) == 1 and uploaded_files[0].name.lower().endswith('.zip'):
+            with st.spinner("Processing ZIP archive..."):
+                result = process_zip_file(uploaded_files[0])
+                if result["successful"] > 0:
+                    st.success(f"✅ Successfully processed {result['successful']} of {result['total']} files from ZIP archive")
+                else:
+                    st.error("❌ Failed to process any files from the ZIP archive")
         else:
-            st.error("Failed to upload legal document")
+            # Process all selected files
+            with st.spinner(f"Processing {len(uploaded_files)} files..."):
+                result = process_multiple_files(uploaded_files)
+                if result["successful"] > 0:
+                    st.success(f"✅ Successfully processed {result['successful']} of {result['total']} files")
+                else:
+                    st.error("❌ Failed to process any files")
 
     # Email Sync
     st.subheader("Email Sync")
