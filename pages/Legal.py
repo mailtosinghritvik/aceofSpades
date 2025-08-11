@@ -883,22 +883,19 @@ def sanitize_text(text):
 
 # New: export last assistant message to DOCX (moved above usage)
 
-def export_last_assistant_message_to_docx():
-    """Export the last assistant message to a Word document and return (BytesIO, filename).
-    Returns (None, reason) on failure."""
+def export_assistant_messages_to_docx(messages_texts):
+    """Export provided assistant message texts (chronological list) to DOCX.
+    Returns (BytesIO, filename) or (None, reason)."""
     if not _DOCX_AVAILABLE:
         return None, "python-docx not installed. Add python-docx to requirements and restart."
+    if not messages_texts:
+        return None, "No messages selected"
+    import re as _re
+    inline_pattern = _re.compile(r'\*\*(.+?)\*\*|(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)')
     try:
-        if 'messages' not in st.session_state or not st.session_state.messages:
-            return None, "No messages available"
-        last_assistant_msg = next((m['content'].strip() for m in reversed(st.session_state.messages)
-                                   if m.get('role') == 'assistant' and m.get('content')), None)
-        if not last_assistant_msg:
-            return None, "No assistant message found"
-
         doc = Document()
-        doc.core_properties.title = f"Legal Assistant Response {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        doc.add_heading('Legal Assistant Response', level=1)
+        doc.core_properties.title = f"Legal Assistant Responses {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        doc.add_heading('Legal Assistant Responses', level=1)
         if st.session_state.get('current_thread_name'):
             meta_p = doc.add_paragraph()
             meta_p.add_run("Thread: ").bold = True
@@ -908,85 +905,84 @@ def export_last_assistant_message_to_docx():
             ts_p.add_run(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
             doc.add_paragraph('')
 
-        import re as _re
-        lines = last_assistant_msg.splitlines()
-        in_code = False
-        code_buf = []
-
-        def flush_code():
-            nonlocal in_code, code_buf
-            if code_buf:
-                p = doc.add_paragraph()
-                r = p.add_run('\n'.join(code_buf))
-                r.font.name = 'Courier New'
+        def render_block(text, heading=None):
+            lines = text.splitlines()
             in_code = False
             code_buf = []
-
-        inline_pattern = _re.compile(r'\*\*(.+?)\*\*|(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)')
-
-        def add_md_paragraph(text, list_type=None):
-            p = doc.add_paragraph()
-            if list_type == 'bullet':
-                p.style = 'List Bullet'
-            elif list_type == 'number':
-                p.style = 'List Number'
-            pos = 0
-            tokens = []
-            for m in inline_pattern.finditer(text):
-                if m.start() > pos:
-                    tokens.append(('text', text[pos:m.start()]))
-                if m.group(1):
-                    tokens.append(('bold', m.group(1)))
-                else:
-                    tokens.append(('italic', m.group(2)))
-                pos = m.end()
-            if pos < len(text):
-                tokens.append(('text', text[pos:]))
-            if not tokens:
-                tokens = [('text', text)]
-            for kind, val in tokens:
-                run = p.add_run(val)
-                if kind == 'bold':
-                    run.bold = True
-                elif kind == 'italic':
-                    run.italic = True
-
-        for raw_line in lines:
-            line = raw_line.rstrip('\n')
-            stripped = line.strip()
-            if stripped.startswith('```'):
+            def flush_code():
+                nonlocal in_code, code_buf
+                if code_buf:
+                    p = doc.add_paragraph()
+                    r = p.add_run('\n'.join(code_buf))
+                    r.font.name = 'Courier New'
+                in_code = False
+                code_buf = []
+            def add_md_paragraph(t, list_type=None):
+                p = doc.add_paragraph()
+                if list_type == 'bullet':
+                    p.style = 'List Bullet'
+                elif list_type == 'number':
+                    p.style = 'List Number'
+                pos = 0
+                tokens = []
+                for m in inline_pattern.finditer(t):
+                    if m.start() > pos:
+                        tokens.append(('text', t[pos:m.start()]))
+                    if m.group(1):
+                        tokens.append(('bold', m.group(1)))
+                    else:
+                        tokens.append(('italic', m.group(2)))
+                    pos = m.end()
+                if pos < len(t):
+                    tokens.append(('text', t[pos:]))
+                if not tokens:
+                    tokens = [('text', t)]
+                for kind, val in tokens:
+                    run = p.add_run(val)
+                    if kind == 'bold':
+                        run.bold = True
+                    elif kind == 'italic':
+                        run.italic = True
+            if heading:
+                doc.add_heading(heading, level=2)
+            for raw_line in lines:
+                line = raw_line.rstrip('\n')
+                stripped = line.strip()
+                if stripped.startswith('```'):
+                    if in_code: flush_code()
+                    else:
+                        in_code = True
+                        code_buf = []
+                    continue
                 if in_code:
-                    flush_code()
-                else:
-                    in_code = True
-                    code_buf = []
-                continue
-            if in_code:
-                code_buf.append(line)
-                continue
-            if stripped.startswith('#'):
-                level = len(stripped) - len(stripped.lstrip('#'))
-                title = stripped[level:].strip()
-                doc.add_heading(title if title else ' ', level=min(level, 4))
-                continue
-            if stripped == '':
-                doc.add_paragraph('')
-                continue
-            if _re.match(r'^[-*]\s+', stripped):
-                add_md_paragraph(_re.sub(r'^[-*]\s+', '', stripped), list_type='bullet')
-                continue
-            if _re.match(r'^\d+\.\s+', stripped):
-                add_md_paragraph(_re.sub(r'^\d+\.\s+', '', stripped), list_type='number')
-                continue
-            add_md_paragraph(line)
-        if in_code:
-            flush_code()
-
-        bio = io.BytesIO()
-        doc.save(bio)
-        bio.seek(0)
-        fname = f"legal_assistant_response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
-        return bio, fname
+                    code_buf.append(line)
+                    continue
+                if stripped.startswith('#'):
+                    level = len(stripped) - len(stripped.lstrip('#'))
+                    title = stripped[level:].strip()
+                    doc.add_heading(title if title else ' ', level=min(level, 4))
+                    continue
+                if stripped == '':
+                    doc.add_paragraph('')
+                    continue
+                if _re.match(r'^[-*]\s+', stripped):
+                    add_md_paragraph(_re.sub(r'^[-*]\s+', '', stripped), list_type='bullet')
+                    continue
+                if _re.match(r'^\d+\.\s+', stripped):
+                    add_md_paragraph(_re.sub(r'^\d+\.\s+', '', stripped), list_type='number')
+                    continue
+                add_md_paragraph(line)
+            if in_code: flush_code()
+        multi = len(messages_texts) > 1
+        for i, msg in enumerate(messages_texts, start=1):
+            heading = f"Response {i}" if multi else None
+            render_block(msg, heading=heading)
+            if multi and i < len(messages_texts):
+                sep = doc.add_paragraph()
+                sep_run = sep.add_run('―' * 40)
+                sep_run.bold = True
+        bio = io.BytesIO(); doc.save(bio); bio.seek(0)
+        return bio, f"legal_assistant_responses_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
     except Exception as e:
         return None, f"Export error: {e}"
 
@@ -1210,19 +1206,57 @@ with st.sidebar:
             st.warning("Please select a thread to extract knowledge from")
 
     # Add export feature
-    st.subheader("Export Last Answer")
-    if st.button("Export Last Assistant Message to Word"):
-        bio, result = export_last_assistant_message_to_docx()
-        if bio:
-            st.success("Export ready. Download below.")
-            st.download_button(
-                label="Download .docx",
-                data=bio,
-                file_name=result,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            )
-        else:
-            st.error(result)
+    st.subheader("Export Assistant Messages")
+    assistant_msgs_all = [m['content'] for m in st.session_state.get('messages', []) if m.get('role') == 'assistant']
+    if assistant_msgs_all:
+        max_assistant = len(assistant_msgs_all)
+        default_count = min(2, max_assistant)
+        count = st.number_input("Number of recent assistant messages", min_value=1, max_value=max_assistant, value=default_count, step=1, key="export_assistant_count")
+        recent_msgs = assistant_msgs_all[-count:]  # chronological segment (oldest to newest in that slice)
+        st.caption("Select which of these recent messages to include:")
+        selected_texts = []
+        # Show newest first for convenience, but keep mapping
+        for rel_index, msg in enumerate(reversed(recent_msgs)):  # newest first
+            # Compute chronological index inside recent list
+            chrono_index = count - rel_index  # 1..count (older has lower number)
+            key_base = f"export_select_{chrono_index}_{len(msg)}"
+            include = st.checkbox(f"Include Response {chrono_index}", value=True, key=key_base)
+            with st.expander(f"Preview Response {chrono_index}"):
+                st.write(msg)
+            if include:
+                # We'll collect after loop in chronological order
+                pass
+        # Build selected_texts in chronological order
+        for i in range(count):
+            chrono_label = i + 1
+            # Determine key used above: we generated key with length; recreate search
+            # Simpler: iterate again oldest->newest and reconstruct key
+        selected_texts_chronological = []
+        for idx, msg in enumerate(recent_msgs):  # oldest->newest
+            chrono_label = idx + 1
+            key_prefix = f"export_select_{chrono_label}_"
+            # Find matching key in session_state
+            matched = [k for k in st.session_state.keys() if k.startswith(key_prefix)]
+            if matched and st.session_state[matched[0]]:
+                selected_texts_chronological.append(msg)
+        if st.button("Generate Word Document"):
+            if not selected_texts_chronological:
+                st.warning("Select at least one message to export.")
+            else:
+                bio, filename = export_assistant_messages_to_docx(selected_texts_chronological)
+                if bio:
+                    st.success("Export ready below.")
+                    st.download_button(
+                        label="Download .docx",
+                        data=bio,
+                        file_name=filename,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
+                else:
+                    st.error(filename)
+    else:
+        st.caption("No assistant messages yet to export.")
+    # ...existing code continues...
 
 # Main chat interface
 if st.session_state.current_thread_id:
