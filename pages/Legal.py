@@ -21,6 +21,13 @@ import base64
 import io
 from PIL import Image
 import unicodedata
+# Replace direct docx import with safe import
+try:
+    from docx import Document  # Added for Word export
+    _DOCX_AVAILABLE = True
+except ImportError:
+    _DOCX_AVAILABLE = False
+    Document = None
 
 # Email configuration
 email_sender = st.secrets["EMAIL_SENDER"]  # Use Streamlit secrets for securi
@@ -30,6 +37,13 @@ EMAIL_RECEIVER = "mailtosinghritvik@gmail.com"
 # Assistant IDs
 MAIN_ASSISTANT_ID = "asst_XyZMGdTIIvPQGUzHzdBuvZvn"
 KNOWLEDGE_EXTRACTION_ASSISTANT_ID = "asst_eroB2BdDIRXlR7SikvVV7OgP"
+# New: selectable model options for dynamic updates
+MODEL_OPTIONS = [
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4o-mini",
+]
 
 # Initialize Supabase client
 try:
@@ -84,6 +98,20 @@ def get_client():
             st.error(f"Error initializing OpenAI client: {str(e)}")
             return None
     return st.session_state.openai_client
+
+# New helper to retrieve & cache the main assistant
+def get_main_assistant():
+    client = get_client()
+    if not client:
+        return None
+    if 'assistant' not in st.session_state:
+        try:
+            st.session_state.assistant = client.beta.assistants.retrieve(MAIN_ASSISTANT_ID)
+            st.session_state.current_model = getattr(st.session_state.assistant, 'model', None)
+        except Exception as e:
+            st.error(f"Failed to load assistant: {e}")
+            return None
+    return st.session_state.assistant
 
 def load_threads_from_db():
     """Load threads from Supabase database"""
@@ -353,7 +381,10 @@ def ask_question(question, thread_id):
             return None
 
         thread = st.session_state.threads[thread_id]['thread']
-        assistant = client.beta.assistants.retrieve("asst_XyZMGdTIIvPQGUzHzdBuvZvn")
+        # Use cached / updated assistant
+        assistant = get_main_assistant()
+        if not assistant:
+            return "Assistant unavailable."
 
         # Create message
         message = client.beta.threads.messages.create(
@@ -389,7 +420,6 @@ def ask_question(question, thread_id):
         )
         
         return messages.data[0].content[0].text.value
-
     except Exception as e:
         st.error(f"Error processing question: {str(e)}")
         return None
@@ -851,6 +881,115 @@ def sanitize_text(text):
     
     return result
 
+# New: export last assistant message to DOCX (moved above usage)
+
+def export_last_assistant_message_to_docx():
+    """Export the last assistant message to a Word document and return (BytesIO, filename).
+    Returns (None, reason) on failure."""
+    if not _DOCX_AVAILABLE:
+        return None, "python-docx not installed. Add python-docx to requirements and restart."
+    try:
+        if 'messages' not in st.session_state or not st.session_state.messages:
+            return None, "No messages available"
+        last_assistant_msg = next((m['content'].strip() for m in reversed(st.session_state.messages)
+                                   if m.get('role') == 'assistant' and m.get('content')), None)
+        if not last_assistant_msg:
+            return None, "No assistant message found"
+
+        doc = Document()
+        doc.core_properties.title = f"Legal Assistant Response {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        doc.add_heading('Legal Assistant Response', level=1)
+        if st.session_state.get('current_thread_name'):
+            meta_p = doc.add_paragraph()
+            meta_p.add_run("Thread: ").bold = True
+            meta_p.add_run(st.session_state.current_thread_name)
+            ts_p = doc.add_paragraph()
+            ts_p.add_run("Exported: ").bold = True
+            ts_p.add_run(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            doc.add_paragraph('')
+
+        import re as _re
+        lines = last_assistant_msg.splitlines()
+        in_code = False
+        code_buf = []
+
+        def flush_code():
+            nonlocal in_code, code_buf
+            if code_buf:
+                p = doc.add_paragraph()
+                r = p.add_run('\n'.join(code_buf))
+                r.font.name = 'Courier New'
+            in_code = False
+            code_buf = []
+
+        inline_pattern = _re.compile(r'\*\*(.+?)\*\*|(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)')
+
+        def add_md_paragraph(text, list_type=None):
+            p = doc.add_paragraph()
+            if list_type == 'bullet':
+                p.style = 'List Bullet'
+            elif list_type == 'number':
+                p.style = 'List Number'
+            pos = 0
+            tokens = []
+            for m in inline_pattern.finditer(text):
+                if m.start() > pos:
+                    tokens.append(('text', text[pos:m.start()]))
+                if m.group(1):
+                    tokens.append(('bold', m.group(1)))
+                else:
+                    tokens.append(('italic', m.group(2)))
+                pos = m.end()
+            if pos < len(text):
+                tokens.append(('text', text[pos:]))
+            if not tokens:
+                tokens = [('text', text)]
+            for kind, val in tokens:
+                run = p.add_run(val)
+                if kind == 'bold':
+                    run.bold = True
+                elif kind == 'italic':
+                    run.italic = True
+
+        for raw_line in lines:
+            line = raw_line.rstrip('\n')
+            stripped = line.strip()
+            if stripped.startswith('```'):
+                if in_code:
+                    flush_code()
+                else:
+                    in_code = True
+                    code_buf = []
+                continue
+            if in_code:
+                code_buf.append(line)
+                continue
+            if stripped.startswith('#'):
+                level = len(stripped) - len(stripped.lstrip('#'))
+                title = stripped[level:].strip()
+                doc.add_heading(title if title else ' ', level=min(level, 4))
+                continue
+            if stripped == '':
+                doc.add_paragraph('')
+                continue
+            if _re.match(r'^[-*]\s+', stripped):
+                add_md_paragraph(_re.sub(r'^[-*]\s+', '', stripped), list_type='bullet')
+                continue
+            if _re.match(r'^\d+\.\s+', stripped):
+                add_md_paragraph(_re.sub(r'^\d+\.\s+', '', stripped), list_type='number')
+                continue
+            add_md_paragraph(line)
+        if in_code:
+            flush_code()
+
+        bio = io.BytesIO()
+        doc.save(bio)
+        bio.seek(0)
+        fname = f"legal_assistant_response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        return bio, fname
+    except Exception as e:
+        return None, f"Export error: {e}"
+
 # Page UI
 st.title("Legal Assistant")
 st.caption("Chat with your legal documents using AI")
@@ -865,7 +1004,41 @@ if not st.session_state.db_threads_loaded:
 # Sidebar
 with st.sidebar:
     st.header("Legal Document Settings")
-    
+    # Ensure assistant loaded for model info
+    get_main_assistant()
+
+    # New: Model Switching UI
+    st.subheader("Assistant Model")
+    current_model = st.session_state.get('current_model', None)
+    model_choice = st.selectbox(
+        "Select model",
+        MODEL_OPTIONS,
+        index=MODEL_OPTIONS.index(current_model) if current_model in MODEL_OPTIONS else 0,
+        help="Switch the deployed assistant's model globally"
+    )
+    col_model_a, col_model_b = st.columns([1,1])
+    with col_model_a:
+        if st.button("Update Model", use_container_width=True):
+            if not st.session_state.get('assistant'):
+                st.error("Assistant not loaded.")
+            elif model_choice == current_model:
+                st.info("Model unchanged.")
+            else:
+                with st.spinner(f"Updating assistant model to {model_choice}..."):
+                    try:
+                        client = get_client()
+                        updated = client.beta.assistants.update(
+                            MAIN_ASSISTANT_ID,
+                            model=model_choice
+                        )
+                        st.session_state.assistant = updated
+                        st.session_state.current_model = getattr(updated, 'model', model_choice)
+                        st.success(f"Model updated to {st.session_state.current_model}")
+                    except Exception as e:
+                        st.error(f"Update failed: {e}")
+    with col_model_b:
+        st.markdown(f"**Current:** `{current_model or 'unknown'}`")
+
     # Thread Management
     st.subheader("Thread Management")
     new_thread_name = st.text_input("New Thread Name (optional)")
@@ -1035,6 +1208,21 @@ with st.sidebar:
                     st.error("Could not extract conversation history")
         else:
             st.warning("Please select a thread to extract knowledge from")
+
+    # Add export feature
+    st.subheader("Export Last Answer")
+    if st.button("Export Last Assistant Message to Word"):
+        bio, result = export_last_assistant_message_to_docx()
+        if bio:
+            st.success("Export ready. Download below.")
+            st.download_button(
+                label="Download .docx",
+                data=bio,
+                file_name=result,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+        else:
+            st.error(result)
 
 # Main chat interface
 if st.session_state.current_thread_id:
